@@ -1,0 +1,149 @@
+with tx_hashes as
+(
+  select 
+  distinct m.tx_hash
+  from monad.testnet.fact_event_logs m
+  join monad.testnet.fact_transactions t
+    on m.tx_hash = t.tx_hash
+  where (m.contract_address = lower('0x87E1F1824C9356733A25d6beD6b9c87A3b31E107')  -- include all txs related to the NFT address
+    or (m.contract_address = '0x760afe86e5de5fa0ee542fc7b7b713e1c5425701' and m.origin_to_address = '0x224ecb4eae96d31372d1090c3b0233c8310dbbab')) -- include txs that involve a payment for a NFT on Magic Eden
+  -- and m.block_timestamp >= '2025-03-03 18:33:00' -- start of minting phase
+  and t.tx_succeeded = TRUE
+),
+
+transfers as -- this part decodes hexadecimal values to numeric and make sure only the relevant tx hashes are included
+(
+  select 
+    m.block_timestamp,
+    m.tx_hash,
+    m.contract_address AS nft_contract,
+    m.origin_from_address,
+    m.origin_to_address,
+    m.topic_0,
+    m.topic_1,
+    m.topic_2,
+    CASE
+      when topic_3 = NULL
+      then 0
+      else TO_NUMERIC(utils.udf_hex_to_int(topic_3)) -- convert tokenid to numeric
+    END as token_id,
+    CASE
+      when m.contract_address = '0x760afe86e5de5fa0ee542fc7b7b713e1c5425701'
+      then TO_NUMERIC(utils.udf_hex_to_int(REPLACE(m.data, '0x0000000000000000000000000000000000000000000000', ''))) / POWER(10,18) -- make the hex WMON value numeric
+      else 0
+    END as data_converted,
+    t.value as MON_value,
+    t.tx_fee as gas_fee
+  from monad.testnet.fact_event_logs m
+  join monad.testnet.fact_transactions t
+    on m.tx_hash = t.tx_hash
+  join tx_hashes h
+    on m.tx_hash = h.tx_hash
+  where m.tx_hash in (
+    select tx_hash
+    from monad.testnet.fact_event_logs
+    where contract_address = lower('0x87E1F1824C9356733A25d6beD6b9c87A3b31E107')) -- ensure tx_hashes involving skrumpets are only included
+  and (m.contract_address = lower('0x87E1F1824C9356733A25d6beD6b9c87A3b31E107') or m.contract_address = '0x760afe86e5de5fa0ee542fc7b7b713e1c5425701') -- exlcude other parts of txs with irrelvant contracts
+  and (m.topic_0 != '0x17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31') -- exclude setapprovals
+  and (m.topic_2 is not NULL)  -- exclude txs that are not one of the 4 transfer types
+  order by m.block_timestamp
+),
+
+minted as -- extract all the minting txs
+(
+  select 
+    block_timestamp,
+    tx_hash,
+    nft_contract,
+    REPLACE(topic_1, '000000000000000000000000', '') as seller,
+    REPLACE(topic_2, '000000000000000000000000', '') as buyer,
+    token_id,
+    mon_value as final_price,
+    gas_fee,
+    'minted' as transfer_type
+  from transfers
+  where topic_1 = lower('0x0000000000000000000000000000000000000000000000000000000000000000') and token_id is not null
+),
+
+listed_fulfill as -- extract txs of listed NFT sales on Magic Eden
+(
+  select 
+    block_timestamp,
+    tx_hash,
+    nft_contract,
+    REPLACE(topic_1, '000000000000000000000000', '') as seller,
+    REPLACE(topic_2, '000000000000000000000000', '') as buyer,
+    token_id,
+    mon_value / count(*) over (partition by tx_hash) as final_price, -- multiple NFTs could be sold in this tx type so we need to divide full price by number of NFTs sold to get price per NFT
+    gas_fee,
+    'listed_fulfill' as transfer_type
+  from transfers
+  where mon_value > 0 and topic_1 != lower('0x0000000000000000000000000000000000000000000000000000000000000000')
+),
+
+instant_sell as -- extract txs of instant NFT sales on Magic Eden
+(
+  select 
+    block_timestamp,
+    tx_hash,
+    nft_contract,
+    origin_from_address as seller,
+    REPLACE(topic_2, '000000000000000000000000', '') as buyer,
+    token_id,
+    MAX(data_converted) OVER (PARTITION BY tx_hash) AS final_price,
+    gas_fee,
+    'instant_sell' as transfer_type
+  from transfers
+  where topic_1 != lower('0x0000000000000000000000000000000000000000000000000000000000000000') 
+  and mon_value = 0 -- the price paid is not in MON but WMON which is in the data column
+  and tx_hash in (
+    select tx_hash
+    from transfers
+    where nft_contract = lower('0x760afe86e5de5fa0ee542fc7b7b713e1c5425701'))
+),
+
+instant_sell_final as
+(
+  select *
+  from instant_sell
+  where token_id is not NULL
+  and buyer != '0xfdf5cfbcf6503293046ad686bb7fee8e9885b93d' -- exclude irrelvant rows
+),
+
+transfers_regular as -- extract txs that are regular transfers and not sales
+(
+  select 
+    block_timestamp,
+    tx_hash,
+    nft_contract,
+    REPLACE(topic_1, '000000000000000000000000', '') as seller,
+    REPLACE(topic_2, '000000000000000000000000', '') as buyer,
+    token_id,
+    mon_value as final_price,
+    gas_fee,
+    'transfers_regular' as transfer_type
+  from transfers
+  where topic_1 != lower('0x0000000000000000000000000000000000000000000000000000000000000000') 
+  and tx_hash not in (
+    select tx_hash
+    from transfers
+    where nft_contract = lower('0x760afe86e5de5fa0ee542fc7b7b713e1c5425701'))
+    and origin_to_address != '0x0000000000000068f116a894984e2db1123eb395' -- exclude fullfilladvancedorders
+),
+
+processed_transfers as -- concatenate all together
+(
+  select * from minted where token_id is not null
+  union all
+  select * from listed_fulfill where token_id is not null
+  union all
+  select * from instant_sell_final where token_id is not null
+  union all
+  select * from transfers_regular where token_id is not null
+)
+
+select 
+  final_price
+from processed_transfers
+where transfer_type in ('listed_fulfill', 'instant_sell') -- Only count actual sales
+and final_price > 0
